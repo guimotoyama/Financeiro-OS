@@ -376,6 +376,22 @@ body.hide-values .money{filter:blur(8px);user-select:none}
   margin: 0;
 }
 
+.bulk-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  border-radius: 10px;
+  background: var(--card);
+  border: 1px solid var(--accent);
+}
+.bulk-bar #bulkCount {
+  font-size: 13px;
+  color: var(--muted);
+  margin-right: auto;
+}
+
 /* Controle de visibilidade por estado de autenticação */
 body:not(.authenticated) .app { display: none; }
 body.authenticated .login-screen { display: none; }

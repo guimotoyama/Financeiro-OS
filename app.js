@@ -16,13 +16,22 @@ const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
 /* ---------------------- Autenticação ---------------------- */
 let currentUserId = null;
+let APP_READY = false; // true somente quando load() carregou os dados reais com sucesso
 
 function setAuthState(isAuthed) {
   document.body.classList.toggle('authenticated', isAuthed);
 }
 
 async function initApp() {
-  S = await load();
+  APP_READY = false;
+  try {
+    S = await load();
+    APP_READY = true;
+  } catch (e) {
+    console.error('Falha crítica ao carregar dados do servidor:', e);
+    APP_READY = false;
+    return; // não renderiza e não libera salvar enquanto o carregamento não funcionar
+  }
   const startPage = location.hash.replace('#', '');
   if (PAGES[startPage]) ui.page = startPage;
   render();
@@ -36,6 +45,7 @@ sb.auth.onAuthStateChange((_event, session) => {
     initApp();
   } else if (!uid) {
     currentUserId = null;
+    APP_READY = false;
     S = defaultState();
   }
 });
@@ -90,6 +100,76 @@ const shortMonth = ym => {
 };
 const fmtDate = iso => (iso || '').split('-').reverse().join('/');
 const monthsBetween = (a, b) => { const [y1, m1] = a.split('-').map(Number), [y2, m2] = b.split('-').map(Number); return (y2 - y1) * 12 + (m2 - m1); };
+
+/* ---------------------- Feriados e dia útil ---------------------- */
+function addDaysISO(iso, n) {
+  const [y, m, d] = iso.split('-').map(Number);
+  const dt = new Date(y, m - 1, d + n);
+  return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`;
+}
+function dateISOFromYMD(y, m, d) { return `${y}-${pad(m)}-${pad(d)}`; }
+
+// Algoritmo de Gauss/Meeus para calcular a data da Páscoa (domingo) de um ano
+function easterISO(year) {
+  const a = year % 19, b = Math.floor(year / 100), c = year % 100;
+  const d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4), k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31);
+  const day = ((h + l - 7 * m + 114) % 31) + 1;
+  return dateISOFromYMD(year, month, day);
+}
+
+const holidayCache = {};
+function holidaysForYear(year) {
+  if (holidayCache[year]) return holidayCache[year];
+  const easter = easterISO(year);
+  const set = new Set([
+    dateISOFromYMD(year, 1, 1),   // Ano Novo
+    dateISOFromYMD(year, 4, 21),  // Tiradentes
+    dateISOFromYMD(year, 5, 1),   // Dia do Trabalho
+    dateISOFromYMD(year, 9, 7),   // Independência
+    dateISOFromYMD(year, 10, 12), // N. Sra. Aparecida
+    dateISOFromYMD(year, 11, 2),  // Finados
+    dateISOFromYMD(year, 11, 15), // Proclamação da República
+    dateISOFromYMD(year, 12, 25), // Natal
+    addDaysISO(easter, -47), // Carnaval (terça-feira)
+    addDaysISO(easter, -2),  // Sexta-feira Santa
+    addDaysISO(easter, 60),  // Corpus Christi
+  ]);
+  holidayCache[year] = set;
+  return set;
+}
+function isHoliday(iso) { return holidaysForYear(+iso.slice(0, 4)).has(iso); }
+function isWeekend(iso) {
+  const [y, m, d] = iso.split('-').map(Number);
+  const dow = new Date(y, m - 1, d).getDay();
+  return dow === 0 || dow === 6;
+}
+function nextBusinessDay(iso) {
+  let cur = iso;
+  while (isWeekend(cur) || isHoliday(cur)) cur = addDaysISO(cur, 1);
+  return cur;
+}
+
+/* ---------------------- Automação de fatura ---------------------- */
+function computeInvoiceNature(accountId, dateISO) {
+  const acc = S.accounts.find(a => a.id === accountId);
+  if (!acc || !acc.closingDay) return null; // sem automação configurada
+  const day = +dateISO.slice(8, 10);
+  return day < acc.closingDay ? 'fatura_mes' : 'fatura_seg';
+}
+function computeDueDate(accountId) {
+  const acc = S.accounts.find(a => a.id === accountId);
+  if (!acc || !acc.dueDay) return null;
+  const ym = thisYM();
+  const [y, m] = ym.split('-').map(Number);
+  const lastDay = new Date(y, m, 0).getDate();
+  const day = Math.min(acc.dueDay, lastDay);
+  const raw = dateISOFromYMD(y, m, day);
+  return nextBusinessDay(raw);
+}
 
 function parseBR(s) {
   s = String(s ?? '').replace(/[R$\s]/g, '');
@@ -161,35 +241,62 @@ function defaultState() {
     ],
     transactions: [],
     commitments: [],
+    receivables: [],
   };
 }
+
 function migrate(s) {
   const d = defaultState();
   const out = Object.assign({}, d, s);
   out.settings = Object.assign({}, d.settings, s.settings || {});
-  ['accounts', 'pots', 'assets', 'categories', 'transactions', 'commitments'].forEach(k => { if (!Array.isArray(out[k])) out[k] = d[k]; });
+  ['accounts', 'pots', 'assets', 'categories', 'transactions', 'commitments', 'receivables'].forEach(k => { if (!Array.isArray(out[k])) out[k] = d[k]; });
   return out;
 }
 
 /* ---------------------- Persistência (Supabase) ---------------------- */
-const TABLES = ['accounts', 'pots', 'assets', 'categories', 'transactions', 'commitments'];
+const TABLES = ['accounts', 'pots', 'assets', 'categories', 'transactions', 'commitments', 'receivables'];
 
 // mapeia nomes de campo do app (camelCase) <-> nomes de coluna no banco (snake_case)
 const FIELD_MAP = {
   transactions: { desc: 'description' },
   commitments: { desc: 'description' },
+  receivables: { desc: 'description' },
   assets: { ticker: 'ticker', cls: 'cls', qty: 'qty', initialApplied: 'initial_applied', initialValue: 'initial_value', adjust: 'adjust', lastPrice: 'last_price' },
+};
+
+// lista fixa de campos esperados por tabela — garante que todo upsert em lote
+// tenha objetos com EXATAMENTE as mesmas chaves (o Postgrest exige isso em arrays)
+const TABLE_FIELDS = {
+  accounts: ['name', 'kind', 'color', 'logo', 'initial', 'closingDay', 'dueDay'],
+  pots: ['name', 'icon', 'color', 'initial', 'goal', 'deadline'],
+  assets: ['name', 'ticker', 'cls', 'qty', 'color', 'logo', 'initialApplied', 'initialValue', 'adjust', 'lastPrice'],
+  categories: ['name', 'kind', 'color', 'budget'],
+  transactions: ['date', 'desc', 'nature', 'payment', 'category', 'origin', 'dest', 'value', 'grp', 'paid', 'realValue'],
+  commitments: ['desc', 'value', 'due', 'paid'],
+  receivables: ['person', 'desc', 'value', 'date', 'received', 'receivedDate'],
+};
+
+// valores padrão para campos que são NOT NULL no banco, caso o objeto não os tenha ainda
+const FIELD_DEFAULTS = {
+  transactions: { paid: false },
+  commitments: { paid: false },
+  receivables: { received: false },
 };
 
 function toRow(table, obj, userId) {
   const map = FIELD_MAP[table] || {};
-  const row = { user_id: userId };
-  for (const [k, v] of Object.entries(obj)) {
+  const fields = TABLE_FIELDS[table] || Object.keys(obj);
+  const defaults = FIELD_DEFAULTS[table] || {};
+  const row = { id: obj.id, user_id: userId };
+  for (const k of fields) {
     const col = map[k] || k.replace(/[A-Z]/g, m => '_' + m.toLowerCase());
-    row[col] = v === undefined ? null : v;
+    let v = obj[k];
+    if (v === undefined) v = (k in defaults) ? defaults[k] : null;
+    row[col] = v;
   }
   return row;
 }
+
 function fromRow(table, row) {
   const map = FIELD_MAP[table] || {};
   const inv = Object.fromEntries(Object.entries(map).map(([a, b]) => [b, a]));
@@ -208,9 +315,14 @@ async function load() {
   const userId = session.user.id;
 
   const d = defaultState();
-  const out = { version: d.version, settings: d.settings, accounts: [], pots: [], assets: [], categories: [], transactions: [], commitments: [] };
+  const out = { version: d.version, settings: d.settings, accounts: [], pots: [], assets: [], categories: [], transactions: [], commitments: [], receivables: [] };
 
-  const { data: settingsRow } = await sb.from('settings').select('*').eq('user_id', userId).maybeSingle();
+  const { data: settingsRow, error: errSettings } = await sb.from('settings').select('*').eq('user_id', userId).maybeSingle();
+  if (errSettings) {
+    console.error('settings', errSettings);
+    toast('❌ Falha ao carregar configurações do servidor. Recarregue a página (F5). Não faça alterações até conseguir carregar com sucesso.', true);
+    throw new Error('load_failed_settings');
+  }
   if (settingsRow) {
     out.settings = {
       theme: settingsRow.theme, hide: settingsRow.hide, appName: settingsRow.app_name,
@@ -220,11 +332,14 @@ async function load() {
 
   for (const table of TABLES) {
     const { data, error } = await sb.from(table).select('*').eq('user_id', userId);
-    if (error) { console.warn(table, error); continue; }
+    if (error) {
+      console.error(table, error);
+      toast(`❌ Falha ao carregar "${table}" do servidor. Recarregue a página (F5). Não faça alterações até conseguir carregar com sucesso.`, true);
+      throw new Error('load_failed_' + table);
+    }
     out[table] = data.map(r => fromRow(table, r));
   }
 
-  // se não há NADA no banco ainda (primeira vez), semeia com o default
   const isEmpty = TABLES.every(t => out[t].length === 0) && !settingsRow;
   if (isEmpty) return migrate(defaultState());
 
@@ -233,40 +348,63 @@ async function load() {
 
 let SAVING = false;
 async function save() {
+  if (!APP_READY) {
+    console.warn('save() bloqueado: os dados ainda não foram carregados com sucesso nesta sessão.');
+    toast('⚠️ Não é possível salvar agora: os dados não foram carregados corretamente. Recarregue a página (F5).', true);
+    return;
+  }
   const { data: { session } } = await sb.auth.getSession();
   if (!session) return;
   const userId = session.user.id;
   SAVING = true; updateSaveIndicator();
+  let hadError = false;
 
   try {
-    await sb.from('settings').upsert({
+    const r0 = await sb.from('settings').upsert({
       user_id: userId, theme: S.settings.theme, hide: S.settings.hide,
       app_name: S.settings.appName, goal_pct: S.settings.goalPct, brapi_token: S.settings.brapiToken,
     });
+    if (r0.error) { console.error('settings', r0.error); hadError = true; }
 
     for (const table of TABLES) {
-      const { data: existing } = await sb.from(table).select('id').eq('user_id', userId);
+      const { data: existing, error: errSel } = await sb.from(table).select('id').eq('user_id', userId);
+      if (errSel) { console.error(table, 'select', errSel); hadError = true; continue; }
       const existingIds = new Set((existing || []).map(r => r.id));
       const currentIds = new Set(S[table].map(x => x.id));
 
       const toDelete = [...existingIds].filter(id => !currentIds.has(id));
-      if (toDelete.length) await sb.from(table).delete().eq('user_id', userId).in('id', toDelete);
+      if (toDelete.length) {
+        const { error: errDel } = await sb.from(table).delete().eq('user_id', userId).in('id', toDelete);
+        if (errDel) { console.error(table, 'delete', errDel); hadError = true; }
+      }
 
       if (S[table].length) {
         const rows = S[table].map(obj => toRow(table, obj, userId));
-        await sb.from(table).upsert(rows);
+        const { error: errUp } = await sb.from(table).upsert(rows);
+        if (errUp) { console.error(table, 'upsert', errUp); hadError = true; }
       }
     }
   } catch (e) {
     console.error(e);
-    toast('Não foi possível salvar os dados. Verifique sua conexão.', true);
+    hadError = true;
   } finally {
-    SAVING = false; updateSaveIndicator();
+    SAVING = false;
+    if (hadError) {
+      toast('⚠️ Erro ao salvar! Verifique sua conexão e tente novamente. Não recarregue a página agora.', true);
+    }
+    updateSaveIndicator(hadError);
   }
 }
-function updateSaveIndicator() {
+function updateSaveIndicator(hadError = false) {
   const el = $('#saveIndicator');
-  if (el) el.textContent = SAVING ? '💾 Salvando…' : '✅ Salvo';
+  if (!el) return;
+  el.textContent = SAVING ? '💾 Salvando…' : (hadError ? '❌ Erro ao salvar' : '✅ Salvo');
+}
+
+function updateSaveIndicator(hadError = false) {
+  const el = $('#saveIndicator');
+  if (!el) return;
+  el.textContent = SAVING ? '💾 Salvando…' : (hadError ? '❌ Erro ao salvar' : '✅ Salvo');
 }
 
 let S = defaultState(); // placeholder até carregar de fato
@@ -307,41 +445,62 @@ function deltas(t) {
 }
 /* cutoff: considera lançamentos até a data; now=true inclui futuro (faturas/parcelas, agendados, compromissos) */
 function compute({ cutoff = todayISO(), now = true } = {}) {
-  const bal = {}, applied = {}, debt = {};
+  const bal = {}, applied = {}, debt = {}, debtReal = {};
   S.accounts.forEach(a => bal[a.id] = +a.initial || 0);
   S.pots.forEach(p => bal[p.id] = +p.initial || 0);
   S.assets.forEach(a => { bal[a.id] = (+a.initialValue || 0) + (+a.adjust || 0); applied[a.id] = +a.initialApplied || 0; });
   let scheduled = 0;
   for (const t of S.transactions) {
     const v = +t.value || 0, future = t.date > cutoff;
-    if (CREDIT.includes(t.nature)) { if (!future || now) debt[t.origin] = (debt[t.origin] || 0) + v; continue; }
+    if (CREDIT.includes(t.nature)) {
+      if (!t.paid && (!future || now)) {
+        const rv = (t.realValue != null) ? (+t.realValue || 0) : v;
+        debt[t.origin] = (debt[t.origin] || 0) + v;
+        debtReal[t.origin] = (debtReal[t.origin] || 0) + rv;
+      }
+      continue;
+    }
     if (future) { if (now && t.nature === 'saida') scheduled += v; continue; }
     if (t.nature === 'resgate' && applied[t.origin] !== undefined) {
       const cur = bal[t.origin] || 0, ratio = cur > 0 ? Math.min(1, v / cur) : 0;
       applied[t.origin] -= applied[t.origin] * ratio;
     }
     if (t.nature === 'aporte' && applied[t.dest] !== undefined) applied[t.dest] += v;
-    if (t.nature === 'pag_fatura') { const c = t.dest || t.origin; debt[c] = (debt[c] || 0) - v; }
+    if (t.nature === 'pag_fatura') {
+      const c = t.dest || t.origin;
+      debt[c] = (debt[c] || 0) - v;
+      debtReal[c] = (debtReal[c] || 0) - v;
+    }
     deltas(t).forEach(([id, d]) => { if (id) bal[id] = (bal[id] || 0) + d; });
   }
   const sum = arr => arr.reduce((s, x) => s + (bal[x.id] || 0), 0);
   const accSum = sum(S.accounts), potSum = sum(S.pots), assetSum = sum(S.assets);
   const debtTotal = Object.values(debt).reduce((s, x) => s + Math.max(0, x), 0);
+  const debtTotalReal = Object.values(debtReal).reduce((s, x) => s + Math.max(0, x), 0);
   const commitments = now ? S.commitments.filter(c => !c.paid).reduce((s, c) => s + (+c.value || 0), 0) : 0;
-  const gross = accSum + potSum + assetSum;
-  return { bal, applied, debt, accSum, potSum, assetSum, debtTotal, scheduled: now ? scheduled : 0, commitments, gross, total: gross - debtTotal - (now ? scheduled : 0) - commitments };
+  const receivablesTotal = S.receivables.filter(r => !r.received).reduce((s, r) => s + (+r.value || 0), 0);
+  const gross = accSum + potSum + assetSum + receivablesTotal;
+  return {
+    bal, applied, debt, debtReal, accSum, potSum, assetSum,
+    debtTotal, debtTotalReal, receivablesTotal,
+    scheduled: now ? scheduled : 0, commitments, gross,
+    total: gross - debtTotalReal - (now ? scheduled : 0) - commitments,
+  };
 }
+
 const refreshCache = () => { cache.C = compute(); };
 
 function monthStats(ym) {
-  const r = { ym, entrada: 0, flash: 0, rend: 0, saidas: 0, fatura: 0, faturaSeg: 0, aportes: 0, resgates: 0, byCat: {}, count: 0 };
+  const r = { ym, entrada: 0, flash: 0, rend: 0, saidas: 0, fatura: 0, faturaSeg: 0, faturaReal: 0, faturaSegReal: 0, aportes: 0, resgates: 0, byCat: {}, count: 0 };
   const inv = investCatId();
   const spend = (cid, v) => { const k = cid || '_none'; r.byCat[k] = (r.byCat[k] || 0) + v; };
   const prev = addMonthsYM(ym, -1);
   r.carry = 0;
+  r.carryReal = 0;
   for (const t of S.transactions) {
     const v = +t.value || 0;
-    if (t.nature === 'fatura_seg' && t.date.startsWith(prev)) r.carry += v;
+    const rv = (t.realValue != null) ? (+t.realValue || 0) : v; // sua parte real, ou o valor cheio se não preenchido
+    if (t.nature === 'fatura_seg' && t.date.startsWith(prev)) { r.carry += v; r.carryReal += rv; }
     if (!t.date.startsWith(ym)) continue;
     r.count++;
     switch (t.nature) {
@@ -349,14 +508,15 @@ function monthStats(ym) {
       case 'flash': r.flash += v; break;
       case 'rendimento': r.rend += v; break;
       case 'saida': r.saidas += v; spend(t.category, v); break;
-      case 'fatura_mes': r.fatura += v; spend(t.category, v); break;
-      case 'fatura_seg': r.faturaSeg += v; spend(t.category, v); break;
+      case 'fatura_mes': r.fatura += v; r.faturaReal += rv; spend(t.category, rv); break;
+      case 'fatura_seg': r.faturaSeg += v; r.faturaSegReal += rv; spend(t.category, rv); break;
       case 'aporte': r.aportes += v; spend(inv, v); break;
       case 'resgate': r.resgates += v; break;
     }
   }
   r.entradas = r.entrada + r.flash + r.rend;
-  r.faturaBruta = r.fatura + r.carry;
+  r.faturaBruta = r.fatura + r.carry;            // valor total que será cobrado (cash-flow real, não muda com valor real)
+  r.faturaLiquida = r.faturaReal + r.carryReal;   // sua parte real da fatura, descontando o que é de terceiros
   r.saldo = r.entradas - r.saidas;
   r.sobraFatura = r.saldo - r.faturaBruta;
   r.sobraPct = r.entradas > 0 ? r.sobraFatura / r.entradas * 100 : 0;
@@ -372,6 +532,7 @@ function monthStats(ym) {
   r.naoPct = r.gastos > 0 ? r.nao / r.gastos * 100 : 0;
   return r;
 }
+
 const classAssets = cls => S.assets.filter(a => a.cls === cls);
 const classValue = cls => classAssets(cls).reduce((s, a) => s + (cache.C.bal[a.id] || 0), 0);
 const classLabel = cls => { const l = classAssets(cls); return l.length === 1 ? l[0].name : ASSET_CLASSES[cls]; };
@@ -552,12 +713,12 @@ function renderDashboard() {
       ${kpi('Entrada Total', M.entradas, { tone: 'pos', sub: `Entradas ${fmt(M.entrada)} · Flash ${fmt(M.flash)} · Rend. ${fmt(M.rend)}` })}
       ${kpi('Saída Total', M.saidas, { tone: 'neg', sub: 'Débito, Pix, dinheiro, TED, boleto' })}
       ${kpi('Fatura Bruta', M.faturaBruta, { tone: 'warn', sub: M.carry > 0 ? `Inclui ${fmt(M.carry)} do mês anterior` : 'Compras no cartão deste mês' })}
+      ${kpi('Fatura Líquida', M.faturaLiquida, { tone: 'info', sub: M.faturaLiquida !== M.faturaBruta ? `Sua parte real` : 'Igual à bruta — nenhum valor de terceiros' })}
       ${kpi('Saldo do Mês', M.saldo, { tone: M.saldo >= 0 ? 'pos' : 'neg', signed: true, sub: 'Entradas − Saídas' })}
+      ${kpi('Fatura Seguinte', M.faturaSeg, { tone: 'warn', sub: 'Já comprometida p/ próximo mês' })}
       ${kpi('Sobra da Fatura', M.sobraFatura, { tone: M.sobraFatura >= 0 ? 'pos' : 'neg', signed: true, sub: 'Saldo do mês − Fatura bruta' })}
       ${kpi('Patrimônio Líquido Total', C.total, { tone: 'acc', signed: true, sub: 'Hoje, já descontando dívidas futuras' })}
       ${kpi('Sobra do Mês %', fmtPct(M.sobraPct), { raw: true, tone: M.sobraPct >= goal ? 'pos' : 'warn', cls: sgn(M.sobraPct), sub: goal ? `Meta: ${fmtPct(goal, 0)} das entradas` : 'Sobra da fatura ÷ entradas' })}
-      ${kpi('Fatura Seguinte', M.faturaSeg, { tone: 'warn', sub: 'Já comprometida p/ próximo mês' })}
-      ${kpi('Sobra após Aportes', M.sobraAposAportes, { tone: M.sobraAposAportes >= 0 ? 'pos' : 'neg', signed: true, sub: 'Sobra da fatura − investimentos' })}
     </div>
   </section>
 
@@ -676,9 +837,15 @@ function renderTx() {
       <button class="btn primary" data-act="newTx">+ Novo lançamento</button>
     </div>
     <div class="kpi-grid" id="txSummary" style="margin-bottom:14px"></div>
+    <div class="bulk-bar" id="bulkBar" hidden>
+      <span id="bulkCount"></span>
+      <button class="btn sm" data-act="bulkPay">✅ Marcar pagas</button>
+      <button class="btn sm ghost" data-act="bulkUnpay">↩️ Marcar não pagas</button>
+      <button class="btn sm ghost" data-act="bulkClear">Cancelar seleção</button>
+    </div>
     <div class="card table-wrap">
       <table class="tbl">
-        <thead><tr><th>Data</th><th>Descrição</th><th>Natureza</th><th>Pagamento</th><th>Categoria</th><th>Origem</th><th style="text-align:right">Valor</th><th></th></tr></thead>
+        <thead><tr><th><input type="checkbox" id="selAll"></th><th>Data</th><th>Descrição</th><th>Natureza</th><th>Pagamento</th><th>Categoria</th><th>Origem</th><th style="text-align:right">Valor</th><th>Pago</th><th></th></tr></thead>
         <tbody id="txBody"></tbody>
       </table>
       <div id="txEmpty"></div>
@@ -687,6 +854,8 @@ function renderTx() {
   bind('#fSearch', 'q'); bind('#fNature', 'nature', 'change'); bind('#fCat', 'cat', 'change'); bind('#fLoc', 'loc', 'change'); bind('#fAll', 'all', 'change', true);
   renderTxTable();
 }
+
+const selected = new Set();
 function renderTxTable() {
   const list = filteredTx();
   let inn = 0, out = 0;
@@ -698,18 +867,50 @@ function renderTxTable() {
     const N = NATURES[t.nature] || { label: t.nature, tone: 'neutral' };
     const c = catById(t.category) || (NATURES[t.nature]?.cat ? { name: 'Sem categoria', color: '#94a3b8' } : null);
     const prefix = N.tone === 'pos' ? '+' : (N.tone === 'neg' || N.tone === 'warn') ? '−' : '';
+    const isCredit = CREDIT.includes(t.nature);
+    const realLine = (t.realValue != null && t.realValue !== t.value) ? `<div class="sm-t">👥 sua parte: ${fmt(t.realValue)}</div>` : '';
     return `<tr>
+      <td>${isCredit ? `<input type="checkbox" class="rowSel" data-id="${t.id}" ${selected.has(t.id) ? 'checked' : ''}>` : ''}</td>
       <td>${fmtDate(t.date)}</td>
       <td>${esc(t.desc)}${t.date > todayISO() ? '<span class="sub">agendado / futuro</span>' : ''}</td>
       <td><span class="badge ${N.tone}">${esc(N.label)}</span></td>
       <td>${esc(t.payment || '—')}</td>
       <td>${c ? `<span class="cat-name"><i class="dot" style="--c:${esc(c.color)}"></i>${esc(c.name)}</span>` : '<span class="muted">—</span>'}</td>
       <td>${esc(locName(t.origin))}${t.dest ? ` <span class="muted">→</span> ${esc(locName(t.dest))}` : ''}</td>
-      <td class="num ${N.tone === 'neutral' || N.tone === 'info' ? '' : N.tone === 'warn' ? 'warn' : N.tone}">${prefix}${money(t.value)}</td>
+      <td class="num ${N.tone === 'neutral' || N.tone === 'info' ? '' : N.tone === 'warn' ? 'warn' : N.tone}">${prefix}${money(t.value)}${realLine}</td>
+      <td>${isCredit ? `<button class="row-btn" title="${t.paid ? 'Marcar como não paga' : 'Marcar como paga'}" data-act="togglePaid" data-id="${t.id}">${t.paid ? '✅' : '⬜'}</button>` : '—'}</td>
       <td class="act"><button class="row-btn" title="Editar" data-act="editTx" data-id="${t.id}">✏️</button><button class="row-btn" title="Excluir" data-act="delTx" data-id="${t.id}">🗑️</button></td>
     </tr>`;
   }).join('');
   $('#txEmpty').innerHTML = list.length ? '' : '<div class="empty">Nenhum lançamento neste filtro. Clique em <b>+ Novo lançamento</b> ou importe seu CSV.</div>';
+  bindRowSelection();
+  updateBulkBar();
+}
+
+function bindRowSelection() {
+  $$('.rowSel').forEach(cb => cb.addEventListener('change', e => {
+    const id = e.target.dataset.id;
+    if (e.target.checked) selected.add(id); else selected.delete(id);
+    updateBulkBar();
+  }));
+
+  const selAll = $('#selAll');
+  if (selAll) {
+    selAll.checked = false;
+    selAll.addEventListener('change', e => {
+      $$('.rowSel').forEach(cb => {
+        cb.checked = e.target.checked;
+        if (e.target.checked) selected.add(cb.dataset.id); else selected.delete(cb.dataset.id);
+      });
+      updateBulkBar();
+    });
+  }
+}
+
+function updateBulkBar() {
+  const bar = $('#bulkBar'); if (!bar) return;
+  bar.hidden = selected.size === 0;
+  $('#bulkCount').textContent = `${selected.size} selecionada(s)`;
 }
 
 /* ----- Formulário de lançamento ----- */
@@ -717,16 +918,21 @@ function openTxModal(t) {
   const edit = !!(t && t.id);
   const isCur = ui.month === thisYM();
   const d = t || { date: isCur ? todayISO() : ui.month + '-01', desc: '', nature: 'saida', payment: 'Pix', category: '', origin: '', dest: '', value: '' };
+  const natureOptions = Object.entries(NATURES).map(([k, n]) => {
+    const hide = !edit && CREDIT.includes(k); // em criação, oculta fatura_mes/fatura_seg (é automático)
+    return `<option value="${k}" ${k === d.nature ? 'selected' : ''} ${hide ? 'hidden' : ''}>${esc(n.label)}</option>`;
+  }).join('');
   const body = `
     <div class="form-grid">
       ${fi('Data', 'date', d.date, { type: 'date', req: true })}
       ${fi('Valor (R$)', 'value', d.value === '' ? '' : numStr(d.value), { req: true, mode: 'decimal', ph: '0,00' })}
       ${fi('Descrição', 'desc', d.desc, { req: true, span: true, ph: 'Ex.: Supermercado, Salário, Netflix…' })}
-      ${fs('Natureza', 'nature', Object.entries(NATURES).map(([k, n]) => [k, n.label]), d.nature)}
       ${fs('Pagamento', 'payment', PAYMENTS.map(p => [p, p]), d.payment || 'Pix')}
-      <label data-f="cat">Categoria<select name="category"></select></label>
       <label data-f="origin"><span class="lbl-o">Origem</span><select name="origin"></select></label>
+      <label>Natureza<select name="nature">${natureOptions}</select></label>
+      <label data-f="cat">Categoria<select name="category"></select></label>
       <label data-f="dest"><span class="lbl-d">Destino</span><select name="dest"></select></label>
+      <div class="span2" data-f="real">${fi('Valor real (sua parte) — R$', 'realValue', d.realValue != null ? numStr(d.realValue) : '', { mode: 'decimal', ph: 'Deixe em branco se o valor é todo seu', hint: 'Preencha só se parte desta compra foi de outra pessoa (ex.: compra dividida). Usado apenas para corrigir seus relatórios de gasto — não afeta a fatura real.' })}</div>
       ${edit ? '' : `
       <div class="span2" data-f="inst"><div class="note">
         <div class="inline-fields">Parcelas: <input type="number" name="parcelas" min="2" max="60" value="2">
@@ -751,6 +957,21 @@ function openTxModal(t) {
     const inst = $('[data-f=inst]', form), rep = $('[data-f=repeat]', form);
     if (inst) inst.hidden = !(E.payment.value === 'Parcelado' && N.credit);
     if (rep) rep.hidden = E.payment.value === 'Parcelado' && N.credit;
+    const real = $('[data-f=real]', form);
+    if (real) real.hidden = !N.credit;
+  };
+
+  const autoNature = () => {
+    const nat = E.nature.value;
+    if (!CREDIT.includes(nat)) return;
+    const accId = E.origin.value, date = E.date.value;
+    if (!accId || !date) return;
+    const suggested = computeInvoiceNature(accId, date);
+    if (suggested && suggested !== nat) {
+      E.nature.value = suggested;
+      sync();
+      toast(`Natureza ajustada automaticamente para "${NATURES[suggested].label}" com base no fechamento da conta.`);
+    }
   };
   E.nature.addEventListener('change', () => {
     const nat = E.nature.value, pay = E.payment.value;
@@ -759,14 +980,18 @@ function openTxModal(t) {
     if (nat === 'transferencia' && !['Pix', 'TED', 'Dinheiro'].includes(pay)) E.payment.value = 'Pix';
     sync();
   });
+  E.origin.addEventListener('change', autoNature);
+  E.date.addEventListener('change', autoNature);
   E.payment.addEventListener('change', () => {
     const pay = E.payment.value, nat = E.nature.value;
     if (['Crédito', 'Parcelado'].includes(pay) && nat === 'saida') E.nature.value = 'fatura_mes';
     if (!['Crédito', 'Parcelado'].includes(pay) && CREDIT.includes(nat)) E.nature.value = 'saida';
     sync();
+    autoNature();
   });
   sync(d);
 }
+
 function saveTx(fd, editing) {
   const nature = fd.get('nature'), N = NATURES[nature];
   const value = parseBR(fd.get('value'));
@@ -778,9 +1003,21 @@ function saveTx(fd, editing) {
   if (dest && dest === origin) { toast('Origem e destino não podem ser iguais.', true); return false; }
   const category = nature === 'aporte' ? investCatId() : (N.cat ? fd.get('category') : '');
   if (N.cat && !category) { toast('Selecione a categoria.', true); return false; }
+
+  let realValue = null;
+  if (N.credit) {
+    const rawReal = (fd.get('realValue') || '').trim();
+    if (rawReal) {
+      const rv = parseBR(rawReal);
+      if (isNaN(rv) || rv < 0) { toast('O valor real não pode ser negativo.', true); return false; }
+      if (rv > value) { toast('O valor real não pode ser maior que o valor total.', true); return false; }
+      realValue = rv;
+    }
+  }
+
   const base = { date, desc: (fd.get('desc') || '').trim(), nature, payment: fd.get('payment'), category, origin, dest };
   if (editing) {
-    Object.assign(editing, base, { value });
+    Object.assign(editing, base, { value, realValue });
     toast('Lançamento atualizado.');
   } else {
     const parcelado = base.payment === 'Parcelado' && N.credit;
@@ -788,10 +1025,20 @@ function saveTx(fd, editing) {
     const rep = !parcelado ? Math.max(1, Math.min(60, +fd.get('repeat') || 1)) : 1;
     const count = Math.max(n, rep), grp = count > 1 ? uid() : undefined;
     let part = value, first = value;
-    if (parcelado && fd.get('parcMode') === 'total') { part = Math.floor(value / n * 100) / 100; first = Math.round((value - part * (n - 1)) * 100) / 100; }
+    let realPart = realValue, realFirst = realValue;
+    if (parcelado && fd.get('parcMode') === 'total') {
+      part = Math.floor(value / n * 100) / 100;
+      first = Math.round((value - part * (n - 1)) * 100) / 100;
+      if (realValue != null) {
+        realPart = Math.floor(realValue / n * 100) / 100;
+        realFirst = Math.round((realValue - realPart * (n - 1)) * 100) / 100;
+      }
+    }
     for (let i = 0; i < count; i++) {
       S.transactions.push({
-        ...base, id: uid(), date: addMonthsISO(date, i), value: i === 0 ? first : part, grp,
+        ...base, id: uid(), date: addMonthsISO(date, i), value: i === 0 ? first : part,
+        realValue: parcelado ? (i === 0 ? realFirst : realPart) : realValue,
+        grp,
         desc: parcelado ? `${base.desc} (${i + 1}/${n})` : base.desc,
       });
     }
@@ -799,6 +1046,7 @@ function saveTx(fd, editing) {
   }
   commit();
 }
+
 function deleteTx(id) {
   const t = S.transactions.find(x => x.id === id); if (!t) return;
   const series = t.grp ? S.transactions.filter(x => x.grp === t.grp) : [];
@@ -811,6 +1059,19 @@ function deleteTx(id) {
     $('#delOne').onclick = () => { S.transactions = S.transactions.filter(x => x.id !== id); closeModal(); commit(); toast('Lançamento excluído.'); };
     $('#delAll').onclick = () => { S.transactions = S.transactions.filter(x => x.grp !== t.grp); closeModal(); commit(); toast('Série excluída.'); };
   } else confirmBox(`Excluir "${t.desc}" (${fmt(t.value)})?`, () => { S.transactions = S.transactions.filter(x => x.id !== id); commit(); toast('Lançamento excluído.'); });
+}
+
+function togglePaid(id) {
+  const t = S.transactions.find(x => x.id === id); if (!t) return;
+  t.paid = !t.paid;
+  commit();
+  toast(t.paid ? 'Marcada como paga.' : 'Marcada como não paga.');
+}
+function markManyPaid(ids, paid) {
+  if (!ids.length) return;
+  ids.forEach(id => { const t = S.transactions.find(x => x.id === id); if (t) t.paid = paid; });
+  commit();
+  toast(`${ids.length} lançamento(s) marcado(s) como ${paid ? 'pago' : 'não pago'}.`);
 }
 
 /* ---------------------- CONTAS ---------------------- */
@@ -828,14 +1089,17 @@ function renderContas() {
     </div>
     <div class="block-head"><h2>Suas contas</h2><span class="sub">Fluxo de ${monthLabel(ym)}</span><button class="btn primary spacer" data-act="newAcc">+ Nova conta</button></div>
     <div class="grid auto-lg">
+
       ${S.accounts.map(a => {
         const f = flows[a.id] || { in: 0, out: 0 }, debt = Math.max(0, C.debt[a.id] || 0);
+        const due = a.dueDay ? computeDueDate(a.id) : null;
         return `<div class="card entity">
           <div class="entity-head">${logoEl(a)}<div><h3>${esc(a.name)}</h3><span class="muted" style="font-size:12px">${a.kind === 'beneficio' ? 'Benefício (Flash)' : 'Conta / Cartão'}</span></div></div>
           <div class="val">${money(C.bal[a.id] || 0, sgn(C.bal[a.id]) === 'neg' ? 'neg' : '')}</div>
           <div class="row"><span>Entrou no mês</span><b class="pos">${money(f.in)}</b></div>
           <div class="row"><span>Saiu no mês</span><b class="neg">${money(f.out)}</b></div>
           <div class="row"><span>Fatura do cartão em aberto</span><b class="${debt > 0 ? 'warn' : ''}">${money(debt)}</b></div>
+          ${due ? `<div class="row"><span>Vencimento deste mês</span><b>${fmtDate(due)}</b></div>` : ''}
           <div class="actions">
             <button class="btn sm" data-act="adjAcc" data-id="${a.id}">Conferir saldo</button>
             <button class="btn sm ghost" data-act="editAcc" data-id="${a.id}">Editar</button>
@@ -843,9 +1107,11 @@ function renderContas() {
           </div>
         </div>`;
       }).join('')}
+
     </div>
     <div class="note" style="margin-top:18px">💡 <b>Dica:</b> use <b>Conferir saldo</b> para igualar o saldo do app ao saldo real do banco. Para abater a fatura do cartão, lance um <b>Pagamento de Fatura</b>.</div>`;
 }
+
 function accountForm(a) {
   const edit = !!a;
   openModal({
@@ -855,16 +1121,22 @@ function accountForm(a) {
       ${fs('Tipo', 'kind', [['conta', 'Conta bancária / cartão'], ['beneficio', 'Benefício (Flash, VR, VA)']], a?.kind || 'conta')}
       ${fi('Cor', 'color', a?.color || '#6366f1', { type: 'color' })}
       ${fi('Caminho da logo', 'logo', a?.logo || '', { span: true, ph: 'assets/logos/meubanco.png', hint: 'Coloque a imagem na pasta do projeto (VS Code) e informe o caminho. Opcional.' })}
+      ${fi('Dia de fechamento da fatura', 'closingDay', a?.closingDay ?? '', { type: 'number', min: 1, max: 31, ph: 'Ex.: 11', hint: 'Só para cartões. Compras a partir deste dia (inclusive) caem na fatura seguinte. Deixe em branco se não for cartão.' })}
+      ${fi('Dia de vencimento da fatura', 'dueDay', a?.dueDay ?? '', { type: 'number', min: 1, max: 31, ph: 'Ex.: 18', hint: 'Usado só para exibir a data de vencimento (ajustada para o próximo dia útil).' })}
       ${edit ? '' : fi('Saldo atual (R$)', 'initial', '0', { mode: 'decimal', span: true })}
     </div>`,
     onSubmit: fd => {
       const name = fd.get('name').trim(); if (!name) return false;
-      const o = { name, kind: fd.get('kind'), color: fd.get('color'), logo: fd.get('logo').trim() };
+      const closingRaw = fd.get('closingDay'), dueRaw = fd.get('dueDay');
+      const closingDay = closingRaw ? Math.max(1, Math.min(31, parseInt(closingRaw, 10))) : null;
+      const dueDay = dueRaw ? Math.max(1, Math.min(31, parseInt(dueRaw, 10))) : null;
+      const o = { name, kind: fd.get('kind'), color: fd.get('color'), logo: fd.get('logo').trim(), closingDay, dueDay };
       if (edit) Object.assign(a, o); else S.accounts.push({ id: 'acc_' + uid(), ...o, initial: parseBR(fd.get('initial')) || 0 });
       commit();
     },
   });
 }
+
 function adjustBalance(item, label) {
   const cur = cache.C.bal[item.id] || 0;
   openModal({
@@ -1092,8 +1364,8 @@ function renderPatrimonio() {
       <div>
         <small>PATRIMÔNIO LÍQUIDO TOTAL</small>
         <div class="big">${money(C.total, sgn(C.total))}</div>
-        <div class="pills"><span class="pill">Ativos <b>${money(C.gross)}</b></span><span class="pill">Passivos <b>${money(C.debtTotal + C.scheduled + C.commitments)}</b></span></div>
-        <p class="muted" style="margin-top:14px;font-size:12.5px">Saldos de contas + cofrinhos + investimentos − faturas de cartão (inclusive parcelas futuras) − lançamentos agendados − compromissos futuros (IPVA etc.).</p>
+        <div class="pills"><span class="pill">Ativos <b>${money(C.gross)}</b></span><span class="pill">Passivos <b>${money(C.debtTotalReal + C.scheduled + C.commitments)}</b></span></div>
+        <p class="muted" style="margin-top:14px;font-size:12.5px">Saldos de contas + cofrinhos + investimentos + a receber de terceiros − sua parte real das faturas de cartão (inclusive parcelas futuras) − lançamentos agendados − compromissos futuros (IPVA etc.).</p>
       </div>
       <div class="chart-box"><canvas id="chNet2"></canvas></div>
     </div>
@@ -1106,9 +1378,10 @@ function renderPatrimonio() {
           ${S.pots.map(p => row(esc(p.name), C.bal[p.id] || 0, { indent: 1, cls: '' })).join('')}
           ${row('<b>Investimentos</b>', C.assetSum, { cls: '' })}
           ${classes.map(c => row(c[0], c[1], { indent: 1, cls: '' })).join('')}
+          ${C.receivablesTotal > 0 ? row('<b>A Receber de Terceiros</b>', C.receivablesTotal, { cls: '' }) : ''}
           ${row('<b>= Total de ativos</b>', C.gross, { cls: 'pos' })}
-          ${row('<b>(−) Faturas de cartão e parcelas futuras</b>', C.debtTotal, { minus: 1, cls: 'neg' })}
-          ${S.accounts.filter(a => (C.debt[a.id] || 0) > 0).map(a => row('Cartão ' + esc(a.name), C.debt[a.id], { indent: 1, minus: 1, cls: 'neg' })).join('')}
+          ${row('<b>(−) Sua parte real das faturas de cartão e parcelas futuras</b>', C.debtTotalReal, { minus: 1, cls: 'neg' })}
+          ${S.accounts.filter(a => (C.debt[a.id] || 0) > 0).map(a => row('Cartão ' + esc(a.name) + ' (bruto: ' + fmt(C.debt[a.id]) + ')', Math.max(0, C.debtReal[a.id] || 0), { indent: 1, minus: 1, cls: 'neg' })).join('')}
           ${row('<b>(−) Saídas agendadas (datas futuras)</b>', C.scheduled, { minus: 1, cls: 'neg' })}
           ${row('<b>(−) Compromissos futuros</b>', C.commitments, { minus: 1, cls: 'neg' })}
           <tr><td><b>= PATRIMÔNIO LÍQUIDO</b></td><td class="num ${sgn(C.total)}" style="font-size:16px">${money(C.total)}</td></tr>
@@ -1116,6 +1389,21 @@ function renderPatrimonio() {
       </div>
       <div class="card"><div class="block-head"><h2>Onde está seu patrimônio</h2></div><div class="chart-box" style="height:300px"><canvas id="chComp"></canvas></div></div>
     </div>
+
+    <section class="block">
+      <div class="block-head"><h2>A Receber de Terceiros</h2><span class="sub">Valores pendentes somam no patrimônio como ativo</span><button class="btn primary spacer" data-act="newReceivable">+ Novo "a receber"</button></div>
+      <div class="card table-wrap">
+        <table class="tbl" style="min-width:560px"><thead><tr><th>Pessoa</th><th>Descrição</th><th>Data</th><th>Status</th><th style="text-align:right">Valor</th><th></th></tr></thead><tbody>
+          ${S.receivables.slice().sort((a, b) => (a.date || '').localeCompare(b.date || '')).map(r => `<tr>
+            <td>${esc(r.person)}</td><td>${esc(r.desc || '—')}</td><td>${r.date ? fmtDate(r.date) : '—'}</td>
+            <td><span class="badge ${r.received ? 'pos' : 'warn'}">${r.received ? 'Recebido' : 'Pendente'}</span></td>
+            <td class="num">${money(r.value)}</td>
+            <td class="act">${r.received ? '' : `<button class="row-btn" title="Marcar como recebido" data-act="markReceived" data-id="${r.id}">✅</button>`}<button class="row-btn" title="Editar" data-act="editReceivable" data-id="${r.id}">✏️</button><button class="row-btn" title="Excluir" data-act="delReceivable" data-id="${r.id}">🗑️</button></td>
+          </tr>`).join('')}
+        </tbody></table>
+        ${S.receivables.length ? '' : '<div class="empty">Nenhum valor a receber cadastrado. Use para controlar compras parceladas que você pagou mas são de outra pessoa.</div>'}
+      </div>
+    </section>
 
     <section class="block">
       <div class="block-head"><h2>Compromissos futuros</h2><span class="sub">Despesas que ainda não estão em fatura (IPVA, seguro, IPTU…)</span><button class="btn primary spacer" data-act="newCommit">+ Novo compromisso</button></div>
@@ -1144,6 +1432,7 @@ function renderPatrimonio() {
     options: { plugins: { legend: { display: false }, tooltip: tipMoney, title: { display: true, text: 'Evolução (12 meses, estimada pelos lançamentos)' } }, scales: { y: axisMoney } },
   });
   const comp = [['Contas', C.accSum, '#60a5fa'], ['Cofrinhos', C.potSum, '#34d399'], ...['acao', 'tesouro', 'cripto', 'outro'].map((c, i) => [ASSET_CLASSES[c], classValue(c), ['#a78bfa', '#38bdf8', '#fbbf24', '#94a3b8'][i]])].filter(x => x[1] > 0);
+  if (C.receivablesTotal > 0) comp.push(['A Receber', C.receivablesTotal, '#f43f5e']);
   chart('chComp', {
     type: 'doughnut',
     data: { labels: comp.map(c => c[0]), datasets: [{ data: comp.map(c => c[1]), backgroundColor: comp.map(c => c[2]), borderWidth: 0 }] },
@@ -1155,6 +1444,7 @@ function renderPatrimonio() {
     options: { plugins: { legend: { display: false }, tooltip: tipMoney }, scales: { y: axisMoney } },
   });
 }
+
 function commitForm(c) {
   const edit = !!c;
   openModal({
@@ -1171,6 +1461,56 @@ function commitForm(c) {
       commit();
     },
   });
+}
+
+function receivableForm(r) {
+  const edit = !!r;
+  openModal({
+    title: edit ? 'Editar "a receber"' : 'Novo "a receber"',
+    body: `<div class="form-grid">
+      ${fi('Pessoa', 'person', r?.person || '', { req: true, ph: 'Ex.: Pai, Maria, João…' })}
+      ${fi('Descrição (opcional)', 'desc', r?.desc || '', { span: true, ph: 'Ex.: Metade do notebook' })}
+      ${fi('Valor (R$)', 'value', r ? numStr(r.value) : '', { req: true, mode: 'decimal' })}
+      ${fi('Data', 'date', r?.date || todayISO(), { type: 'date', req: true })}
+    </div>`,
+    onSubmit: fd => {
+      const person = fd.get('person').trim(); if (!person) { toast('Informe a pessoa.', true); return false; }
+      const v = parseBR(fd.get('value')); if (!(v > 0)) { toast('Informe um valor maior que zero.', true); return false; }
+      const date = fd.get('date'); if (!date) { toast('Informe a data.', true); return false; }
+      const o = { person, desc: fd.get('desc').trim(), value: v, date };
+      if (edit) Object.assign(r, o);
+      else S.receivables.push({ id: uid(), received: false, receivedDate: null, ...o });
+      commit();
+    },
+  });
+}
+
+function markReceived(r) {
+  if (!r) return;
+  openModal({
+    title: `Marcar como recebido — ${r.person}`,
+    body: `<div class="form-grid">
+      ${fi('Valor recebido (R$)', 'value', numStr(r.value), { mode: 'decimal', req: true })}
+      ${fi('Data do recebimento', 'date', todayISO(), { type: 'date', req: true })}
+      <label class="span2">Entra na conta<select name="acc">${locOptions(['acc'], '')}</select></label>
+    </div>`,
+    onSubmit: fd => {
+      const v = parseBR(fd.get('value')), acc = fd.get('acc'), date = fd.get('date');
+      if (!(v > 0)) { toast('Informe um valor maior que zero.', true); return false; }
+      if (!acc) { toast('Selecione a conta que recebeu.', true); return false; }
+      if (!date) { toast('Informe a data.', true); return false; }
+      S.transactions.push({ id: uid(), date, desc: `Recebimento de ${r.person}${r.desc ? ' — ' + r.desc : ''}`, nature: 'entrada', payment: 'Pix', category: '', origin: acc, dest: '', value: v });
+      r.received = true;
+      r.receivedDate = date;
+      commit();
+      toast('Marcado como recebido e lançado como entrada.');
+    },
+  });
+}
+
+function deleteReceivable(id) {
+  const r = S.receivables.find(x => x.id === id); if (!r) return;
+  confirmBox(`Excluir "a receber" de ${r.person} (${fmt(r.value)})?`, () => { S.receivables = S.receivables.filter(x => x.id !== id); commit(); toast('Excluído.'); });
 }
 
 /* ---------------------- CONFIGURAÇÕES ---------------------- */
@@ -1399,6 +1739,10 @@ const actions = {
   newTx: () => openTxModal(),
   editTx: id => openTxModal(S.transactions.find(t => t.id === id)),
   delTx: id => deleteTx(id),
+  togglePaid: id => togglePaid(id),
+  bulkPay: () => { markManyPaid([...selected], true); selected.clear(); renderTxTable(); },
+  bulkUnpay: () => { markManyPaid([...selected], false); selected.clear(); renderTxTable(); },
+  bulkClear: () => { selected.clear(); renderTxTable(); },
   exportCsv, exportJson,
   importCsv: () => $('#fileCsv').click(),
   importJson: () => $('#fileJson').click(),
@@ -1417,6 +1761,9 @@ const actions = {
   newCommit: () => commitForm(), editCommit: id => commitForm(S.commitments.find(c => c.id === id)),
   payCommit: id => { const c = S.commitments.find(x => x.id === id); c.paid = !c.paid; commit(); },
   delCommit: id => confirmBox('Excluir este compromisso?', () => { S.commitments = S.commitments.filter(c => c.id !== id); commit(); }),
+  newReceivable: () => receivableForm(), editReceivable: id => receivableForm(S.receivables.find(r => r.id === id)),
+  markReceived: id => markReceived(S.receivables.find(r => r.id === id)),
+  delReceivable: id => deleteReceivable(id),
   addCat: () => { S.categories.push({ id: 'cat_' + uid(), name: 'Nova categoria', kind: 'nao_essencial', color: '#8b5cf6', budget: 0 }); commit(); },
   delCat: id => {
     const n = S.transactions.filter(t => t.category === id).length;
