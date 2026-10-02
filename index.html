@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="pt-BR" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Financeiro OS</title>
+  <link rel="icon" href="imagens/Favicon.png">
+  <link rel="stylesheet" href="styles.css">
+  <link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#10b981">
+<link rel="apple-touch-icon" href="imagens/Favicon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Financeiro OS">
+</head>
+<body>
+
+<div id="loginScreen" class="login-screen">
+  <form id="loginForm" class="login-box">
+    <h1>🔒 Financeiro OS</h1>
+    <p class="muted">Entre com seu e-mail e senha para acessar seus dados.</p>
+    <label>E-mail
+      <input type="email" id="loginEmail" required autocomplete="username">
+    </label>
+    <label>Senha
+      <input type="password" id="loginPassword" required autocomplete="current-password">
+    </label>
+    <button type="submit" class="btn primary">Entrar</button>
+    <p id="loginError" class="hint"></p>
+  </form>
+</div>
+
+<div class="app">
+
+  <!-- ============ SIDEBAR ============ -->
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <!-- LOGO PRINCIPAL: coloque o arquivo em assets/logo.png (se não existir, aparece o "$") -->
+      <span class="logo-slot lg" style="--c:#10b981"><img src="imagens/Logo-Refeita-Branco 2.png" alt="Logo"></span>
+      <div>
+        <strong id="brandName">Financeiro OS</strong>
+        <small>Controle pessoal</small>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <button class="nav-btn" data-page="dashboard">
+        <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+        Visão Geral
+      </button>
+      <button class="nav-btn" data-page="lancamentos">
+        <svg viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+        Lançamentos
+      </button>
+      <button class="nav-btn" data-page="contas">
+        <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h13v4"/><path d="M3 7v11a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-9a1 1 0 0 0-1-1H5a2 2 0 0 1-2-2z"/><circle cx="16.5" cy="14.5" r="1"/></svg>
+        Contas & Cartões
+      </button>
+      <button class="nav-btn" data-page="investimentos">
+        <svg viewBox="0 0 24 24"><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/></svg>
+        Investimentos
+      </button>
+      <button class="nav-btn" data-page="metas">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/></svg>
+        Metas & Cofrinhos
+      </button>
+      <button class="nav-btn" data-page="patrimonio">
+        <svg viewBox="0 0 24 24"><path d="M3 21h18M5 21V10M9 21V10M15 21V10M19 21V10M2 10l10-6 10 6"/></svg>
+        Patrimônio
+      </button>
+      <button class="nav-btn" data-page="config">
+        <svg viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>
+        Configurações
+      </button>
+    </nav>
+
+    <div class="sidebar-foot">
+  <span class="dot-live"></span> <span id="saveIndicator">✅ Salvo</span>
+  <small>Dados na nuvem (Supabase) · Faça backup em Configurações</small>
+    </div>
+  </aside>
+
+  <div class="scrim" id="scrim"></div>
+
+  <!-- ============ CONTEÚDO ============ -->
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn menu-btn" id="menuBtn" title="Menu">☰</button>
+      <h1 id="pageTitle">Visão Geral</h1>
+
+      <div class="month-nav" id="monthNav">
+        <button class="icon-btn" id="prevMonth" title="Mês anterior">‹</button>
+        <label class="month-label" title="Escolher mês">
+          <span id="monthLabel">—</span>
+          <input type="month" id="monthPicker">
+        </label>
+        <button class="icon-btn" id="nextMonth" title="Próximo mês">›</button>
+        <button class="btn ghost sm" id="todayMonth">Hoje</button>
+      </div>
+
+      <div class="top-actions">
+  <button class="icon-btn" id="hideBtn" title="Ocultar/mostrar valores">👁</button>
+  <button class="icon-btn" id="themeBtn" title="Alternar tema">🌙</button>
+  <button class="btn primary" data-act="newTx">+ <span class="hide-sm">Lançamento</span></button>
+  <button class="icon-btn" id="logoutBtn" title="Sair da conta">🚪</button>
+      </div>
+    </header>
+
+    <main id="view">
+      <section class="page" id="page-dashboard"></section>
+      <section class="page" id="page-lancamentos" hidden></section>
+      <section class="page" id="page-contas" hidden></section>
+      <section class="page" id="page-investimentos" hidden></section>
+      <section class="page" id="page-metas" hidden></section>
+      <section class="page" id="page-patrimonio" hidden></section>
+      <section class="page" id="page-config" hidden></section>
+    </main>
+  </div>
+</div>
+
+<div id="modalRoot"></div>
+<div id="toasts"></div>
+<input type="file" id="fileCsv" accept=".csv,text/csv,text/plain" hidden>
+<input type="file" id="fileJson" accept=".json,application/json" hidden>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
