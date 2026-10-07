@@ -1,11 +1,10 @@
 'use strict';
 /* =========================================================
    Financeiro OS — lógica do app (JavaScript puro)
-   Dados salvos em localStorage. Gráficos: Chart.js (CDN).
+   Dados salvos no Supabase. Gráficos: Chart.js (CDN).
    ========================================================= */
 
 /* ---------------------- Helpers ---------------------- */
-const STORAGE_KEY = 'meu_financeiro_v1';
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 
@@ -261,7 +260,6 @@ const FIELD_MAP = {
   transactions: { desc: 'description' },
   commitments: { desc: 'description' },
   receivables: { desc: 'description' },
-  assets: { ticker: 'ticker', cls: 'cls', qty: 'qty', initialApplied: 'initial_applied', initialValue: 'initial_value', adjust: 'adjust', lastPrice: 'last_price' },
 };
 
 // lista fixa de campos esperados por tabela — garante que todo upsert em lote
@@ -401,12 +399,6 @@ function updateSaveIndicator(hadError = false) {
   el.textContent = SAVING ? '💾 Salvando…' : (hadError ? '❌ Erro ao salvar' : '✅ Salvo');
 }
 
-function updateSaveIndicator(hadError = false) {
-  const el = $('#saveIndicator');
-  if (!el) return;
-  el.textContent = SAVING ? '💾 Salvando…' : (hadError ? '❌ Erro ao salvar' : '✅ Salvo');
-}
-
 let S = defaultState(); // placeholder até carregar de fato
 
 const ui = { page: 'dashboard', month: thisYM(), f: { q: '', nature: '', cat: '', loc: '', all: false } };
@@ -491,7 +483,7 @@ function compute({ cutoff = todayISO(), now = true } = {}) {
 const refreshCache = () => { cache.C = compute(); };
 
 function monthStats(ym) {
-  const r = { ym, entrada: 0, flash: 0, rend: 0, saidas: 0, fatura: 0, faturaSeg: 0, faturaReal: 0, faturaSegReal: 0, aportes: 0, resgates: 0, byCat: {}, count: 0 };
+  const r = { ym, entrada: 0, flash: 0, rend: 0, saidas: 0, fatura: 0, faturaSeg: 0, faturaReal: 0, faturaSegReal: 0, aportes: 0, resgates: 0, byCat: {} };
   const inv = investCatId();
   const spend = (cid, v) => { const k = cid || '_none'; r.byCat[k] = (r.byCat[k] || 0) + v; };
   const prev = addMonthsYM(ym, -1);
@@ -502,7 +494,6 @@ function monthStats(ym) {
     const rv = (t.realValue != null) ? (+t.realValue || 0) : v; // sua parte real, ou o valor cheio se não preenchido
     if (t.nature === 'fatura_seg' && t.date.startsWith(prev)) { r.carry += v; r.carryReal += rv; }
     if (!t.date.startsWith(ym)) continue;
-    r.count++;
     switch (t.nature) {
       case 'entrada': r.entrada += v; break;
       case 'flash': r.flash += v; break;
@@ -520,7 +511,6 @@ function monthStats(ym) {
   r.saldo = r.entradas - r.saidas;
   r.sobraFatura = r.saldo - r.faturaBruta;
   r.sobraPct = r.entradas > 0 ? r.sobraFatura / r.entradas * 100 : 0;
-  r.sobraAposAportes = r.sobraFatura - r.aportes;
   r.totalOut = Object.values(r.byCat).reduce((s, x) => s + x, 0);
   r.ess = 0; r.nao = 0;
   for (const [cid, v] of Object.entries(r.byCat)) {
@@ -665,10 +655,9 @@ function renderDashboard() {
   ${S.transactions.length === 0 ? `
     <div class="empty-banner">
       <div style="font-size:30px">👋</div>
-      <p><b>Bem-vindo!</b> Comece ajustando os saldos em <a href="#contas">Contas</a> e <a href="#investimentos">Investimentos</a>, depois adicione lançamentos ou <b>importe o CSV</b> da sua planilha. Quer só explorar? Carregue dados de exemplo.</p>
+      <p><b>Bem-vindo!</b> Comece ajustando os saldos em <a href="#contas">Contas</a> e <a href="#investimentos">Investimentos</a>, depois adicione lançamentos ou <b>importe o CSV</b> da sua planilha.</p>
       <button class="btn primary" data-act="newTx">+ Novo lançamento</button>
       <button class="btn" data-act="importCsv">Importar CSV</button>
-      <button class="btn ghost" data-act="demo">Carregar exemplo</button>
     </div>` : ''}
 
   <div class="hero">
@@ -715,7 +704,7 @@ function renderDashboard() {
       ${kpi('Fatura Bruta', M.faturaBruta, { tone: 'warn', sub: M.carry > 0 ? `Inclui ${fmt(M.carry)} do mês anterior` : 'Compras no cartão deste mês' })}
       ${kpi('Fatura Líquida', M.faturaLiquida, { tone: 'info', sub: M.faturaLiquida !== M.faturaBruta ? `Sua parte real` : 'Igual à bruta — nenhum valor de terceiros' })}
       ${kpi('Saldo do Mês', M.saldo, { tone: M.saldo >= 0 ? 'pos' : 'neg', signed: true, sub: 'Entradas − Saídas' })}
-      ${kpi('Fatura Seguinte', M.faturaSeg, { tone: 'warn', sub: 'Já comprometida p/ próximo mês' })}
+      ${kpi('Fatura Seguinte', M.faturaSeg, { tone: 'warn', sub: `Líquida: ${fmt(M.faturaSegReal)}` })}
       ${kpi('Sobra da Fatura', M.sobraFatura, { tone: M.sobraFatura >= 0 ? 'pos' : 'neg', signed: true, sub: 'Saldo do mês − Fatura bruta' })}
       ${kpi('Patrimônio Líquido Total', C.total, { tone: 'acc', signed: true, sub: 'Hoje, já descontando dívidas futuras' })}
       ${kpi('Sobra do Mês %', fmtPct(M.sobraPct), { raw: true, tone: M.sobraPct >= goal ? 'pos' : 'warn', cls: sgn(M.sobraPct), sub: goal ? `Meta: ${fmtPct(goal, 0)} das entradas` : 'Sobra da fatura ÷ entradas' })}
@@ -1537,7 +1526,7 @@ function renderConfig() {
       </div>
       <div class="card">
         <div class="block-head"><h2>Backup & Dados</h2></div>
-        <p class="muted" style="font-size:13px;margin-bottom:12px">Seus dados ficam no navegador (localStorage). Faça backup com frequência.</p>
+        <p class="muted" style="font-size:13px;margin-bottom:12px">Seus dados ficam salvos na nuvem (Supabase). Ainda assim, faça backup com frequência por segurança.</p>
         <div class="btn-row">
           <button class="btn" data-act="exportJson">⬇ Exportar backup (JSON)</button>
           <button class="btn" data-act="importJson">⬆ Restaurar backup</button>
@@ -1545,8 +1534,8 @@ function renderConfig() {
           <button class="btn ghost" data-act="importCsv">⬆ Importar lançamentos (CSV)</button>
         </div>
         <p class="hint" style="margin-top:12px">CSV aceito (cabeçalho): <span class="kbd">Data;Descrição;Natureza;Pagamento;Categoria;Origem;Destino;Valor</span> — exatamente as colunas da sua planilha do Excel (salve como CSV).</p>
+
         <div class="btn-row" style="margin-top:14px">
-          <button class="btn ghost" data-act="demo">Carregar dados de exemplo</button>
           <button class="btn danger" data-act="clearTx">Apagar lançamentos</button>
           <button class="btn danger" data-act="resetAll">Resetar tudo</button>
         </div>
@@ -1684,56 +1673,6 @@ function importCsvText(text) {
 }
 function exportJson() { download(`backup-financeiro-${todayISO()}.json`, JSON.stringify(S, null, 2), 'application/json'); toast('Backup exportado.'); }
 
-/* ---------------------- Dados de exemplo ---------------------- */
-function loadDemo() {
-  const ym = thisYM(), td = +todayISO().slice(8);
-  const bals = { acc_mp: 1250.4, acc_nu: 3420.9, acc_xp: 2100, acc_flexf: 680, acc_flashm: 455.2 };
-  S.accounts.forEach(a => { if (bals[a.id] != null) a.initial = bals[a.id]; });
-  const pots = { pot_reserva: [15000, 30000], pot_datas: [800, 2500], pot_carro: [6200, 20000], pot_fatura: [1500, 2800] };
-  S.pots.forEach(p => { if (pots[p.id]) { p.initial = pots[p.id][0]; p.goal = pots[p.id][1]; } });
-  const assets = { ast_btc: [5000, 6400, 0.0012], ast_ipca: [8000, 8900, 0], ast_petr4: [3000, 3600, 90], ast_vale3: [2500, 2300, 40], ast_klbn4: [1800, 1950, 400], ast_csna3: [900, 760, 60] };
-  S.assets.forEach(a => { const x = assets[a.id]; if (x) { a.initialApplied = x[0]; a.initialValue = x[1]; a.adjust = 0; } });
-  S.transactions = []; S.commitments = [];
-  for (let k = 3; k >= 0; k--) {
-    const m = addMonthsYM(ym, -k), cur = k === 0;
-    const D = n => `${m}-${pad(cur ? Math.min(n, td) : n)}`;
-    const add = (day, desc, nature, payment, cat, origin, value, dest = '') => S.transactions.push({ id: uid(), date: D(day), desc, nature, payment, category: cat, origin, dest, value });
-    add(5, 'Salário', 'entrada', 'TED', '', 'acc_nu', 6200);
-    add(7, 'Freelance', 'entrada', 'Pix', '', 'acc_mp', k % 2 ? 900 : 400);
-    add(6, 'Vale alimentação', 'flash', 'TED', '', 'acc_flexf', 900);
-    add(6, 'Vale mobilidade', 'flash', 'TED', '', 'acc_flashm', 350);
-    add(7, 'Aluguel', 'saida', 'Boleto', 'cat_moradia', 'acc_nu', 1800);
-    add(8, 'Conta de luz', 'saida', 'Pix', 'cat_moradia', 'acc_nu', 190 + k * 7);
-    add(8, 'Internet', 'saida', 'Débito', 'cat_moradia', 'acc_nu', 110);
-    add(9, 'Supermercado', 'saida', 'Débito', 'cat_essenciais', 'acc_flexf', 520 + k * 20);
-    add(14, 'Feira e padaria', 'saida', 'Pix', 'cat_essenciais', 'acc_flexf', 140);
-    add(10, 'Transporte por app', 'saida', 'Pix', 'cat_transporte', 'acc_flashm', 160);
-    add(12, 'Combustível', 'saida', 'Débito', 'cat_transporte', 'acc_mp', 230);
-    add(11, 'Farmácia', 'saida', 'Pix', 'cat_saude', 'acc_mp', 85);
-    add(15, 'Cinema e jantar', 'fatura_mes', 'Crédito', 'cat_lazer', 'acc_nu', 240 + k * 15);
-    add(16, 'Netflix', 'fatura_mes', 'Crédito', 'cat_assinaturas', 'acc_nu', 55.9);
-    add(16, 'Spotify', 'fatura_mes', 'Crédito', 'cat_assinaturas', 'acc_nu', 21.9);
-    add(18, 'Tênis', 'fatura_mes', 'Crédito', 'cat_compras', 'acc_nu', 199.9);
-    add(20, 'Curso online', 'fatura_mes', 'Crédito', 'cat_educacao', 'acc_nu', 129);
-    add(20, 'Tarifa bancária', 'saida', 'Débito', 'cat_impostos', 'acc_xp', 29.9);
-    add(22, 'Presente de aniversário', 'fatura_seg', 'Crédito', 'cat_presentes', 'acc_nu', 180);
-    if (k > 0) add(25, 'Pagamento da fatura', 'pag_fatura', 'Pix', '', 'acc_nu', 1100, 'acc_nu');
-    add(25, 'Depósito Reserva de Emergência', 'transferencia', 'Pix', '', 'acc_nu', 500, 'pot_reserva');
-    add(26, 'Aporte PETR4', 'aporte', 'Pix', 'cat_invest', 'acc_xp', 600, 'ast_petr4');
-    add(26, 'Aporte Tesouro IPCA+', 'aporte', 'Pix', 'cat_invest', 'acc_xp', 500, 'ast_ipca');
-    add(27, 'Aporte Bitcoin', 'aporte', 'Pix', 'cat_invest', 'acc_xp', 300, 'ast_btc');
-    add(28, 'Rendimento da conta', 'rendimento', 'Pix', '', 'acc_mp', 38.5);
-    add(28, 'Rendimento Reserva', 'rendimento', 'Pix', '', 'pot_reserva', 92);
-    if (cur) {
-      const grp = uid();
-      for (let i = 0; i < 10; i++) S.transactions.push({ id: uid(), date: addMonthsISO(D(10), i), desc: `Notebook (${i + 1}/10)`, nature: i ? 'fatura_mes' : 'fatura_mes', payment: 'Parcelado', category: 'cat_compras', origin: 'acc_nu', dest: '', value: 350, grp });
-    }
-  }
-  S.commitments.push({ id: uid(), desc: 'IPVA do carro (ano que vem)', value: 1450, due: `${+ym.slice(0, 4) + 1}-01-20`, paid: false });
-  S.categories.find(c => c.id === 'cat_lazer').budget = 300;
-  commit(); toast('Dados de exemplo carregados.');
-}
-
 /* ---------------------- Ações (delegação de eventos) ---------------------- */
 const actions = {
   newTx: () => openTxModal(),
@@ -1769,7 +1708,6 @@ const actions = {
     const n = S.transactions.filter(t => t.category === id).length;
     confirmBox(n ? `Esta categoria tem ${n} lançamentos, que ficarão "sem categoria". Excluir mesmo assim?` : 'Excluir esta categoria?', () => { S.categories = S.categories.filter(c => c.id !== id); S.transactions.forEach(t => { if (t.category === id) t.category = ''; }); commit(); });
   },
-  demo: () => confirmBox('Isso substitui lançamentos, saldos e metas atuais por dados fictícios de exemplo. Continuar?', loadDemo, 'Carregar'),
   clearTx: () => confirmBox('Apagar TODOS os lançamentos? (contas, cofrinhos e ativos são mantidos)', () => { S.transactions = []; commit(); toast('Lançamentos apagados.'); }, 'Apagar'),
   resetAll: () => confirmBox('Resetar TUDO e voltar ao estado inicial? Faça um backup antes!', () => { S = defaultState(); commit(); toast('App resetado.'); }, 'Resetar'),
 };
