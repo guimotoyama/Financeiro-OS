@@ -939,7 +939,7 @@ function openTxModal(t) {
     const nat = E.nature.value, N = NATURES[nat];
     const curO = init ? init.origin : E.origin.value, curD = init ? init.dest : E.dest.value, curC = init ? init.category : E.category.value;
     E.origin.innerHTML = locOptions(N.ot, curO);
-    E.dest.innerHTML = locOptions(N.dt || [], curD, N.dOptional ? 'Mesmo cartão da conta (opcional)' : 'Selecione…');
+    E.dest.innerHTML = locOptions(N.dt || [], curD, N.dOptional ? 'Mesmo cartão da conta' : 'Selecione…');
     E.category.innerHTML = '<option value="">Selecione…</option>' + S.categories.filter(c => c.kind !== 'invest').map(c => `<option value="${c.id}" ${c.id === curC ? 'selected' : ''}>${esc(c.name)}</option>`).join('');
     $('.lbl-o', form).textContent = N.o; $('.lbl-d', form).textContent = N.d || 'Destino';
     $('[data-f=cat]', form).hidden = !N.cat; $('[data-f=dest]', form).hidden = !N.d;
@@ -989,7 +989,7 @@ function saveTx(fd, editing) {
   const origin = fd.get('origin'); if (!origin) { toast('Selecione a origem (' + N.o + ').', true); return false; }
   const dest = N.d ? (fd.get('dest') || '') : '';
   if (N.d && !N.dOptional && !dest) { toast('Selecione o destino (' + N.d + ').', true); return false; }
-  if (dest && dest === origin) { toast('Origem e destino não podem ser iguais.', true); return false; }
+  if (dest && dest === origin && nature !== 'pag_fatura') { toast('Origem e destino não podem ser iguais.', true); return false; }
   const category = nature === 'aporte' ? investCatId() : (N.cat ? fd.get('category') : '');
   if (N.cat && !category) { toast('Selecione a categoria.', true); return false; }
 
@@ -1310,7 +1310,7 @@ function potForm(p) {
     </div>`,
     onSubmit: fd => {
       const name = fd.get('name').trim(); if (!name) return false;
-      const o = { name, icon: fd.get('icon').trim() || '🐷', goal: parseBR(fd.get('goal')) || 0, deadline: fd.get('deadline'), color: fd.get('color') };
+      const o = { name, icon: fd.get('icon').trim() || '🐷', goal: parseBR(fd.get('goal')) || 0, deadline: fd.get('deadline') || null, color: fd.get('color') };
       if (edit) Object.assign(p, o); else S.pots.push({ id: 'pot_' + uid(), ...o, initial: parseBR(fd.get('initial')) || 0 });
       commit();
     },
